@@ -11,8 +11,9 @@
 //!
 //! Cursor is invoked as:
 //! ```text
-//! cursor --headless --model <model> <message>
+//! cursor --headless --model <model> -
 //! ```
+//! with prompt content written to stdin.
 //!
 //! If the model argument is `"default"` or empty, the `--model` flag is omitted
 //! and Cursor's own default model is used.
@@ -26,7 +27,7 @@
 //!   blank-line separator, as the headless CLI does not provide a dedicated
 //!   system-prompt flag.
 //! - **Temperature**: Cursor's headless CLI does not expose a temperature parameter.
-//!   Any temperature value supplied by the caller is silently ignored.
+//!   Only default values are accepted; custom values return an explicit error.
 //!
 //! # Authentication
 //!
@@ -40,7 +41,9 @@
 use crate::providers::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 /// Environment variable for overriding the path to the `cursor` binary.
 pub const CURSOR_PATH_ENV: &str = "CURSOR_PATH";
@@ -50,6 +53,13 @@ const DEFAULT_CURSOR_BINARY: &str = "cursor";
 
 /// Model name used to signal "use Cursor's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
+/// Cursor requests are bounded to avoid hung subprocesses.
+const CURSOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Avoid leaking oversized stderr payloads.
+const MAX_CURSOR_STDERR_CHARS: usize = 512;
+/// Cursor does not support sampling controls; allow only baseline defaults.
+const CURSOR_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
+const TEMP_EPSILON: f64 = 1e-9;
 
 /// Provider that invokes the Cursor headless CLI as a subprocess.
 ///
@@ -81,6 +91,38 @@ impl CursorProvider {
         !trimmed.is_empty() && trimmed != DEFAULT_MODEL_MARKER
     }
 
+    fn supports_temperature(temperature: f64) -> bool {
+        CURSOR_SUPPORTED_TEMPERATURES
+            .iter()
+            .any(|v| (temperature - v).abs() < TEMP_EPSILON)
+    }
+
+    fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
+        if !temperature.is_finite() {
+            anyhow::bail!("Cursor provider received non-finite temperature value");
+        }
+        if !Self::supports_temperature(temperature) {
+            anyhow::bail!(
+                "temperature unsupported by Cursor headless CLI: {temperature}. \
+                 Supported values: 0.7 or 1.0"
+            );
+        }
+        Ok(())
+    }
+
+    fn redact_stderr(stderr: &[u8]) -> String {
+        let text = String::from_utf8_lossy(stderr);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.chars().count() <= MAX_CURSOR_STDERR_CHARS {
+            return trimmed.to_string();
+        }
+        let clipped: String = trimmed.chars().take(MAX_CURSOR_STDERR_CHARS).collect();
+        format!("{clipped}...")
+    }
+
     /// Invoke the cursor binary with the given prompt and optional model.
     /// Returns the trimmed stdout output as the assistant response.
     async fn invoke_cursor(&self, message: &str, model: &str) -> anyhow::Result<String> {
@@ -91,14 +133,14 @@ impl CursorProvider {
             cmd.arg("--model").arg(model);
         }
 
-        cmd.arg(message);
-
-        // Inherit stderr so that Cursor's diagnostic output is visible to the
-        // operator, but capture stdout for the model response.
+        // Read prompt from stdin to avoid exposing sensitive content in process args.
+        cmd.arg("-");
+        cmd.kill_on_drop(true);
+        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().await.map_err(|err| {
+        let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!(
                 "Failed to spawn Cursor binary at {:?}: {err}. \
                  Ensure `cursor` is installed and in PATH, or set CURSOR_PATH.",
@@ -106,17 +148,44 @@ impl CursorProvider {
             )
         })?;
 
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(message.as_bytes())
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to write prompt to Cursor stdin: {err}"))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to finalize Cursor stdin stream: {err}"))?;
+        }
+
+        let output = timeout(CURSOR_REQUEST_TIMEOUT, child.wait_with_output())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Cursor request timed out after {:?} (binary: {:?})",
+                    CURSOR_REQUEST_TIMEOUT,
+                    self.cursor_path
+                )
+            })?
+            .map_err(|err| anyhow::anyhow!("Cursor process failed: {err}"))?;
+
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
+            let stderr_excerpt = Self::redact_stderr(&output.stderr);
+            let stderr_note = if stderr_excerpt.is_empty() {
+                String::new()
+            } else {
+                format!(" Stderr: {stderr_excerpt}")
+            };
             anyhow::bail!(
                 "Cursor exited with non-zero status {code}. \
-                 Check that Cursor is authenticated and the headless CLI is supported."
+                 Check that Cursor is authenticated and the headless CLI is supported.{stderr_note}"
             );
         }
 
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            anyhow::anyhow!("Cursor produced non-UTF-8 output: {err}")
-        })?;
+        let text = String::from_utf8(output.stdout)
+            .map_err(|err| anyhow::anyhow!("Cursor produced non-UTF-8 output: {err}"))?;
 
         Ok(text.trim().to_string())
     }
@@ -135,9 +204,10 @@ impl Provider for CursorProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        // Cursor's headless CLI does not support a temperature parameter; ignored.
-        _temperature: f64,
+        temperature: f64,
     ) -> anyhow::Result<String> {
+        Self::validate_temperature(temperature)?;
+
         // Prepend the system prompt to the user message with a blank-line separator.
         // Cursor's headless CLI does not expose a dedicated system-prompt flag.
         let full_message = match system_prompt {
@@ -230,6 +300,20 @@ mod tests {
         assert!(!CursorProvider::should_forward_model(DEFAULT_MODEL_MARKER));
         assert!(!CursorProvider::should_forward_model(""));
         assert!(!CursorProvider::should_forward_model("   "));
+    }
+
+    #[test]
+    fn validate_temperature_allows_defaults() {
+        assert!(CursorProvider::validate_temperature(0.7).is_ok());
+        assert!(CursorProvider::validate_temperature(1.0).is_ok());
+    }
+
+    #[test]
+    fn validate_temperature_rejects_custom_value() {
+        let err = CursorProvider::validate_temperature(0.2).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("temperature unsupported by Cursor headless CLI"));
     }
 
     #[tokio::test]

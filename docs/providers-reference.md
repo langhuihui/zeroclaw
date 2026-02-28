@@ -68,12 +68,12 @@ credential is not reused for fallback providers.
 ### Cursor (Headless CLI) Notes
 
 - Provider ID: `cursor`
-- Invocation: `cursor --headless [--model <model>] <message>`
+- Invocation: `cursor --headless [--model <model>] -` (prompt is sent via stdin)
 - The `cursor` binary must be in `PATH`, or override its location with `CURSOR_PATH` env var.
 - Authentication is managed by Cursor itself (its own credential store); no API key is required.
 - The model argument is forwarded to cursor as-is; use `"default"` (or leave model empty) to let Cursor select the model.
 - This provider spawns a subprocess per request and is best suited for batch/script usage rather than high-throughput inference.
-- **Limitations**: Only the system prompt (if any) and the last user message are forwarded per request. Full multi-turn conversation history is not preserved because the headless CLI accepts a single prompt per invocation. Temperature control is not supported and is silently ignored.
+- **Limitations**: Only the system prompt (if any) and the last user message are forwarded per request. Full multi-turn conversation history is not preserved because the headless CLI accepts a single prompt per invocation. Temperature control is not supported; non-default values return an explicit error.
 
 ### Vercel AI Gateway Notes
 
